@@ -4,6 +4,7 @@ use crate::error::SendError;
 
 mod channel;
 mod error;
+mod lock;
 
 pub fn bound<T>(cap:usize)-> (Sender<T>,Receiver<T>){
     let inner = Arc::new(Inner::new(Some(cap)));
