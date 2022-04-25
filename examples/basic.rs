@@ -2,7 +2,6 @@ use porticus::bound;
 use tokio::main;
 
 #[tokio::main]
-fn main(){
-    let (tx,rx) = bound(1);
-
+fn main() {
+    let (tx, rx) = bound(1);
 }

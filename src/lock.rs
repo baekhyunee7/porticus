@@ -1,17 +1,12 @@
-use std::thread;
 use crossbeam::utils::Backoff;
-use spin::RwLock;
+use spin::mutex::{SpinMutex, SpinMutexGuard};
 
-pub fn guard<T,F,R>(spin_lock:&RwLock<T>,f:F)->R
-    where  F:Fn(&RwLock<T>)-> Option<R>
-{
+pub fn guard<T>(spin_lock: &SpinMutex<T>) -> SpinMutexGuard<T> {
     let backoff = Backoff::new();
-    loop{
-
-            if let Some(guard) = f(spin_lock){
-                return guard;
-            }
-
+    loop {
+        if let Some(guard) = spin_lock.try_lock() {
+            return guard;
+        }
         backoff.spin();
     }
 }

@@ -1,3 +1,1 @@
-pub enum  SendError{
-
-}
+pub enum SendError {}
