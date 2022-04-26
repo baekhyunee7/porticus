@@ -11,4 +11,3 @@ tokio = {version = "1.17.0",features = ["macros"]}
 spin = "0.9.3"
 futures = "0.3.21"
 pin-project = "1.0.10"
-atomic-option = "0.1.2"

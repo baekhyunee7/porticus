@@ -1,6 +1,5 @@
 use crate::lock::guard;
-use crate::SendResult;
-use atomic_option::AtomicOption;
+use crate::{SendError, SendResult};
 use crossbeam::utils::CachePadded;
 use futures::future::Either;
 use futures::task::AtomicWaker;
@@ -10,12 +9,12 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 pub struct Handle<T> {
-    pub item: AtomicOption<T>,
+    pub item: SpinMutex<Option<T>>,
     pub waker: AtomicWaker,
 }
 
@@ -56,15 +55,15 @@ impl<T> Inner<T> {
         }
     }
 
-    pub fn send(&self, data: &mut Option<T>, cx: &mut Context) -> bool {
+    pub fn send(&self, data: &mut Option<T>, cx: &mut Context) -> Option<Arc<Handle<T>>> {
         let mut guard = guard(&self.data);
-        let mut pending = false;
+        let mut pending = None;
         self.grab_pending(&mut guard);
         if !guard.blocking_receiver.is_empty()
             || self.cap.map(|x| x <= guard.queue.len()).unwrap_or(false)
         {
             let handle = Handle {
-                item: AtomicOption::new(Box::new(data.take().unwrap())),
+                item: SpinMutex::new(Some(data.take().unwrap())),
                 waker: {
                     let waker = AtomicWaker::new();
                     waker.register(cx.waker());
@@ -72,13 +71,13 @@ impl<T> Inner<T> {
                 },
             };
             let handle = Arc::new(handle);
-            guard.blocking_senders.push_back(handle);
-            pending = true;
+            guard.blocking_senders.push_back(handle.clone());
+            pending = Some(handle);
         } else {
             guard.queue.push_back(data.take().unwrap())
         }
         Self::wakeup(&mut guard);
-        !pending
+        pending
     }
 
     fn wakeup(data: &mut SpinMutexGuard<Data<T>>) {
@@ -93,11 +92,14 @@ impl<T> Inner<T> {
 
     fn grab_pending(&self, data: &mut SpinMutexGuard<Data<T>>) {
         while let Some(handle) = data.blocking_senders.pop_front() {
-            if let Some(item) = handle.item.take(Ordering::Release) {
+            let mut guard = guard(&handle.item);
+            if let Some(item) = guard.take() {
                 if self.cap.map(|x| x < data.queue.len()).unwrap_or(true) {
-                    data.queue.push_back(*item);
+                    drop(guard);
+                    data.queue.push_back(item);
                 } else {
-                    handle.item.replace(Some(item), Ordering::Release);
+                    *guard = Some(item);
+                    drop(guard);
                     break;
                 }
             }
@@ -126,8 +128,9 @@ pub struct Receiver<T> {
 #[pin_project]
 pub struct SendFuture<T> {
     pub inner: Arc<Inner<T>>,
-    pub item: Either<Option<T>, Arc<AtomicOption<Handle<T>>>>,
+    pub item: Either<Option<T>, Arc<Handle<T>>>,
 }
+
 
 // 把sending转移
 // sending还有剩余放sending
@@ -139,14 +142,41 @@ impl<T> Future for SendFuture<T> {
         let mut this = self.project();
         match &mut this.item {
             Either::Left(item) if item.is_some() => {
-                if this.inner.send(item, cx) {
-                    Poll::Ready(Ok(()))
-                } else {
+                if let Some(handle) = this.inner.send(item, cx) {
+                    *this.item = Either::Right(handle);
                     Poll::Pending
+                } else {
+                    Poll::Ready(Ok(()))
                 }
             }
-            Either::Right(handle) => Poll::Ready(Ok(())),
-            _ => unreachable!(),
+            Either::Right(handle) => {
+                // todo
+                let handle:&mut Arc<Handle<T>> = handle;
+                // todo: RwLock?
+                let guard = guard(&handle.item);
+                // sender still pending
+                if guard.is_some(){
+                    drop(guard);
+                    handle.waker.register(cx.waker());
+                    Poll::Pending
+                }else{
+                    Poll::Ready(Ok(()))
+                }
+            },
+            _ => Poll::Ready(Err(SendError::UnknownError)),
         }
     }
+}
+
+
+impl<T> Receiver<T>{
+    pub fn receive_future()-> ReceiveFuture<T>{
+        todo!()
+    }
+}
+
+#[pin_project]
+pub struct ReceiveFuture<T>{
+    pub inner: Arc<Inner<T>>,
+    pub waker: AtomicWaker
 }
