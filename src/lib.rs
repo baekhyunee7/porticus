@@ -6,8 +6,20 @@ mod channel;
 mod error;
 mod lock;
 
-pub fn bound<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
+pub fn bounded<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(Inner::new(Some(cap)));
+    (
+        Sender {
+            inner: inner.clone(),
+        },
+        Receiver {
+            inner: inner.clone(),
+        },
+    )
+}
+
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    let inner = Arc::new(Inner::new(None));
     (
         Sender {
             inner: inner.clone(),

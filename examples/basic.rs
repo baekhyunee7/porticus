@@ -1,9 +1,9 @@
-use porticus::bound;
+use porticus::bounded;
 use tokio::main;
 
 #[tokio::main]
 async fn main() {
-    let (tx, rx) = bound(100);
+    let (tx, rx) = bounded(100);
     for i in 0..100 {
         let tx = tx.clone();
         tokio::spawn(async move {
