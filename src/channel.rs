@@ -1,5 +1,5 @@
 use crate::lock::guard;
-use crate::{ReceiveResult, SendError, SendResult};
+use crate::{ReceiveError, ReceiveResult, SendError, SendResult};
 use crossbeam::utils::CachePadded;
 use futures::future::Either;
 use futures::task::AtomicWaker;
@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -80,18 +80,29 @@ impl<T> Inner<T> {
         pending
     }
 
-    pub fn receive(&self, waker_opt: &mut Option<Arc<AtomicWaker>>, cx: &mut Context) -> Option<T> {
+    pub fn receive(
+        &self,
+        waker_opt: &mut Option<Arc<AtomicWaker>>,
+        cx: &mut Context,
+    ) -> std::result::Result<Option<T>, ()> {
         let mut guard = guard(&self.data);
         self.grab_pending(&mut guard);
         if !guard.blocking_receiver.is_empty() {
+            // receivers still pending but disconnected
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(());
+            }
             Self::pending_receiver(&mut guard, waker_opt, cx);
-            None
+            Ok(None)
         } else {
             if let Some(item) = guard.queue.pop_front() {
-                Some(item)
+                Ok(Some(item))
             } else {
+                if self.shutdown.load(Ordering::Acquire) {
+                    return Err(());
+                }
                 Self::pending_receiver(&mut guard, waker_opt, cx);
-                None
+                Ok(None)
             }
         }
     }
@@ -140,6 +151,17 @@ impl<T> Inner<T> {
             handle.waker.wake()
         }
     }
+
+    fn clear_all_pending(&self) {
+        let mut guard = guard(&self.data);
+        self.grab_pending(&mut guard);
+        while let Some(waker) = guard.blocking_receiver.pop_front() {
+            waker.wake()
+        }
+        while let Some(handle) = guard.blocking_senders.pop_front() {
+            handle.waker.wake()
+        }
+    }
 }
 
 pub struct Sender<T> {
@@ -175,6 +197,10 @@ impl<T> Future for SendFuture<T> {
         let mut this = self.project();
         match &mut this.item {
             Either::Left(item) if item.is_some() => {
+                // if not in pending senders, no chance to send
+                if this.inner.shutdown.load(Ordering::Acquire) {
+                    return Poll::Ready(Err(SendError::DisConnected));
+                }
                 if let Some(handle) = this.inner.send(item, cx) {
                     *this.item = Either::Right(handle);
                     Poll::Pending
@@ -183,12 +209,14 @@ impl<T> Future for SendFuture<T> {
                 }
             }
             Either::Right(handle) => {
-                // todo
-                let handle: &mut Arc<Handle<T>> = handle;
                 // todo: RwLock?
                 let guard = guard(&handle.item);
                 // sender still pending
                 if guard.is_some() {
+                    // disconnected
+                    if this.inner.shutdown.load(Ordering::Acquire) {
+                        return Poll::Ready(Err(SendError::DisConnected));
+                    }
                     drop(guard);
                     handle.waker.register(cx.waker());
                     Poll::Pending
@@ -220,10 +248,50 @@ impl<T> Future for ReceiveFuture<T> {
     type Output = ReceiveResult<T>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
-        if let Some(item) = this.inner.receive(&mut this.waker, cx) {
-            Poll::Ready(Ok(item))
+        if let Ok(item_opt) = this.inner.receive(&mut this.waker, cx) {
+            if let Some(item) = item_opt {
+                Poll::Ready(Ok(item))
+            } else {
+                Poll::Pending
+            }
         } else {
-            Poll::Pending
+            Poll::Ready(Err(ReceiveError::DisConnected))
+        }
+    }
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        self.inner.sender_cnt.fetch_add(1, Ordering::Release);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        self.inner.receiver_cnt.fetch_add(1, Ordering::Release);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        if self.inner.sender_cnt.fetch_sub(1, Ordering::Release) <= 1 {
+            self.inner.shutdown.store(true, Ordering::Release);
+            self.inner.clear_all_pending();
+        }
+    }
+}
+
+impl<T> Drop for Receiver<T> {
+    fn drop(&mut self) {
+        if self.inner.receiver_cnt.fetch_sub(1, Ordering::Release) <= 1 {
+            self.inner.shutdown.store(true, Ordering::Release);
+            self.inner.clear_all_pending()
         }
     }
 }
