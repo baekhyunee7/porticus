@@ -1,5 +1,5 @@
 use crate::lock::guard;
-use crate::{SendError, SendResult};
+use crate::{ReceiveResult, SendError, SendResult};
 use crossbeam::utils::CachePadded;
 use futures::future::Either;
 use futures::task::AtomicWaker;
@@ -80,9 +80,43 @@ impl<T> Inner<T> {
         pending
     }
 
+    pub fn receive(&self, waker_opt: &mut Option<Arc<AtomicWaker>>, cx: &mut Context) -> Option<T> {
+        let mut guard = guard(&self.data);
+        self.grab_pending(&mut guard);
+        if !guard.blocking_receiver.is_empty() {
+            Self::pending_receiver(&mut guard, waker_opt, cx);
+            None
+        } else {
+            if let Some(item) = guard.queue.pop_front() {
+                Some(item)
+            } else {
+                Self::pending_receiver(&mut guard, waker_opt, cx);
+                None
+            }
+        }
+    }
+
+    fn pending_receiver(
+        guard: &mut SpinMutexGuard<Data<T>>,
+        waker_opt: &mut Option<Arc<AtomicWaker>>,
+        cx: &mut Context,
+    ) {
+        // still pending
+        if let Some(waker) = waker_opt {
+            waker.register(cx.waker());
+            guard.blocking_receiver.push_back(waker.clone());
+        } else {
+            // new waker
+            let waker = Arc::new(AtomicWaker::new());
+            waker.register(cx.waker());
+            guard.blocking_receiver.push_back(waker.clone());
+            *waker_opt = Some(waker);
+        }
+    }
+
     fn wakeup(data: &mut SpinMutexGuard<Data<T>>) {
-        while let Some(waker) = data.blocking_receiver.pop_front() {
-            if !data.queue.is_empty() {
+        for _ in 0..data.queue.len() {
+            if let Some(waker) = data.blocking_receiver.pop_front() {
                 waker.wake();
             } else {
                 break;
@@ -131,7 +165,6 @@ pub struct SendFuture<T> {
     pub item: Either<Option<T>, Arc<Handle<T>>>,
 }
 
-
 // 把sending转移
 // sending还有剩余放sending
 // 放到sending，不行就sending
@@ -151,32 +184,46 @@ impl<T> Future for SendFuture<T> {
             }
             Either::Right(handle) => {
                 // todo
-                let handle:&mut Arc<Handle<T>> = handle;
+                let handle: &mut Arc<Handle<T>> = handle;
                 // todo: RwLock?
                 let guard = guard(&handle.item);
                 // sender still pending
-                if guard.is_some(){
+                if guard.is_some() {
                     drop(guard);
                     handle.waker.register(cx.waker());
                     Poll::Pending
-                }else{
+                } else {
                     Poll::Ready(Ok(()))
                 }
-            },
+            }
             _ => Poll::Ready(Err(SendError::UnknownError)),
         }
     }
 }
 
-
-impl<T> Receiver<T>{
-    pub fn receive_future()-> ReceiveFuture<T>{
-        todo!()
+impl<T> Receiver<T> {
+    pub fn receive_future(&self) -> ReceiveFuture<T> {
+        ReceiveFuture {
+            inner: self.inner.clone(),
+            waker: None,
+        }
     }
 }
 
 #[pin_project]
-pub struct ReceiveFuture<T>{
+pub struct ReceiveFuture<T> {
     pub inner: Arc<Inner<T>>,
-    pub waker: AtomicWaker
+    pub waker: Option<Arc<AtomicWaker>>,
+}
+
+impl<T> Future for ReceiveFuture<T> {
+    type Output = ReceiveResult<T>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut this = self.project();
+        if let Some(item) = this.inner.receive(&mut this.waker, cx) {
+            Poll::Ready(Ok(item))
+        } else {
+            Poll::Pending
+        }
+    }
 }

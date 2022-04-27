@@ -1,3 +1,5 @@
 pub enum SendError {
-    UnknownError
+    UnknownError,
 }
+
+pub enum ReceiveError {}

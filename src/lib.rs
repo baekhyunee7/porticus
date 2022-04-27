@@ -1,5 +1,5 @@
 use crate::channel::{Inner, Receiver, Sender};
-use crate::error::SendError;
+use crate::error::{ReceiveError, SendError};
 use std::sync::Arc;
 
 mod channel;
@@ -19,6 +19,7 @@ pub fn bound<T>(cap: usize) -> (Sender<T>, Receiver<T>) {
 }
 
 pub type SendResult<T> = std::result::Result<T, SendError>;
+pub type ReceiveResult<T> = std::result::Result<T, ReceiveError>;
 
 #[cfg(test)]
 mod tests {
